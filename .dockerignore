@@ -1,0 +1,65 @@
+# =====================================================================
+# .dockerignore —— 防止敏感与冗余内容进入 Docker 构建上下文
+#
+# 修订记录（内容递增）：
+# - v0.1.0: 初版
+# =====================================================================
+
+# ---- Git ----
+.git/
+.gitignore
+.gitattributes
+
+# ---- 敏感配置（严禁入镜像） ----
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# ---- 本地知识库（不入版本控制，更不入镜像） ----
+.learnings/
+
+# ---- 虚拟环境与缓存 ----
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+.coverage.*
+
+# ---- 测试与文档（不参与运行时） ----
+tests/
+docs/
+*.md
+!app/**/*.md
+.claude/
+
+# ---- 构建产物 ----
+build/
+dist/
+*.egg-info/
+
+# ---- 编辑器 / 系统 ----
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ---- 仓库自身文件（避免无意义复制） ----
+Dockerfile
+docker-compose.yml
+.dockerignore
+requirements-dev.txt
+README.md
+TODO.md
+CLAUDE.md

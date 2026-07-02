@@ -1,0 +1,143 @@
+# =====================================================================
+# gemini_proxy — Docker Compose 编排
+#
+# 修订记录（内容递增）：
+# - v0.1.0: 初版
+# - v0.1.0-r1: 叠加 —— 多 profile (生产/开发)、资源限制、自定义网络、
+#   build args、命名卷挂载 .learnings、HEALTHCHECK 字段精确化、
+#   depends_on 等待上游、port 显式声明
+#
+# 用法：
+#   生产模式:    docker compose up -d
+#   开发模式:    docker compose --profile dev up
+#   查看日志:    docker compose logs -f gemini-proxy
+#   进入容器:    docker compose exec gemini-proxy bash
+#   重建:        docker compose build --no-cache
+# =====================================================================
+
+# ---- 自定义网络（隔离容器流量） ----
+networks:
+  gemini-net:
+    driver: bridge
+    name: gemini-net
+
+# ---- 命名卷：让 .learnings 在容器重启间持久（开发模式尤其有用） ----
+volumes:
+  gemini-learnings:
+
+services:
+  # ===================================================================
+  # gemini-proxy —— 主服务（生产默认）
+  # ===================================================================
+  gemini-proxy:
+    # ---- 镜像构建 ----
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        # 可在 build 时覆盖
+        PYTHON_VERSION: "3.12"
+        APP_USER: app
+        APP_UID: "1000"
+        APP_GID: "1000"
+    image: gemini-proxy:latest
+    container_name: gemini-proxy
+    restart: unless-stopped
+
+    # ---- 端口映射（从 .env 读 PORT，缺省 8000） ----
+    ports:
+      - "${PORT:-8000}:${PORT:-8000}"
+
+    # ---- 环境变量加载（按优先级从低到高）：
+    # 1) Dockerfile ENV 默认值
+    # 2) .env 文件
+    # 3) environment 段（覆盖 .env）
+    env_file:
+      - .env
+    environment:
+      # 时区（容器内时间与宿主机一致）
+      - TZ=${TZ:-Asia/Shanghai}
+      # 显式覆盖（防 .env 缺漏；尤其 PORT 须与 ports 段一致）
+      - HOST=0.0.0.0
+      - PORT=${PORT:-8000}
+      # 容器内 localhost 指向容器自身，访问宿主机需用 host.docker.internal
+      # 如上游在不同主机，可改为 IP 或域名
+      - UPSTREAM_OPENAI_URL=http://host.docker.internal:4000
+
+    # ---- 健康检查（与 Dockerfile HEALTHCHECK 一致；compose 中可更精细） ----
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:${PORT:-8000}/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+    # ---- 资源限制（防 OOM；按需调整） ----
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+        reservations:
+          cpus: "0.1"
+          memory: 64M
+
+    # ---- 网络 ----
+    networks:
+      - gemini-net
+    # ---- 宿主机映射：让容器能通过 host.docker.internal:4000 访问宿主机的 LiteLLM ----
+    # Linux 上 Docker 默认不提供 host.docker.internal，需显式映射
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    # ---- 卷挂载 ----
+    volumes:
+      # 让 .learnings 持久化（容器重建不丢本地知识）
+      - gemini-learnings:/app/.learnings
+
+    # ---- 日志轮转（防磁盘爆满） ----
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ===================================================================
+  # gemini-proxy-dev —— 开发 profile（启用 reload、挂载源码）
+  # 使用：docker compose --profile dev up
+  # ===================================================================
+  gemini-proxy-dev:
+    profiles: ["dev"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    image: gemini-proxy:dev
+    container_name: gemini-proxy-dev
+    restart: unless-stopped
+    ports:
+      - "${PORT:-8000}:${PORT:-8000}"
+    env_file:
+      - .env
+    environment:
+      - TZ=${TZ:-Asia/Shanghai}
+      - HOST=0.0.0.0
+      - LOG_LEVEL=DEBUG
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+    volumes:
+      # 开发模式：源码直接挂载进容器，编辑即生效
+      - ./app:/app/app:ro
+      - gemini-learnings:/app/.learnings
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:${PORT:-8000}/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    networks:
+      - gemini-net
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
