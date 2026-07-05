@@ -21,7 +21,6 @@ from typing import Any, Awaitable, Callable, TypeVar
 import httpx
 from tenacity import (
     AsyncRetrying,
-    RetryError,
     retry_if_exception_type,
     stop_after_attempt,
     wait_exponential,
@@ -77,44 +76,40 @@ def get_retry_decorator() -> Callable[[Callable[..., Awaitable[T]]], Callable[..
 
     def decorator(fn: Callable[..., Awaitable[T]]) -> Callable[..., Awaitable[T]]:
         async def wrapper(*args: Any, **kwargs: Any) -> T:
-            try:
-                async for attempt in AsyncRetrying(
-                    stop=stop_after_attempt(max_attempts),
-                    wait=wait_exponential(
-                        multiplier=settings.retry_base_delay,
-                        exp_base=2,
-                        min=settings.retry_base_delay,
-                        max=settings.retry_base_delay * (2 ** (max_attempts - 1)),
-                    ),
-                    retry=retry_if_exception_type(
-                        RETRYABLE_EXCEPTIONS + (UpstreamRetryableError,)
-                    ),
-                    reraise=True,
-                ):
-                    with attempt:
-                        attempt_number = attempt.retry_state.attempt_number
-                        try:
-                            return await fn(*args, **kwargs)
-                        except UpstreamRetryableError as e:
-                            logger.warning(
-                                f"Upstream retryable error "
-                                f"(attempt {attempt_number}/{max_attempts}, "
-                                f"status={e.response.status_code}), "
-                                f"will retry"
-                            )
-                            raise
-                        except RETRYABLE_EXCEPTIONS as e:
-                            logger.warning(
-                                f"Upstream network error "
-                                f"(attempt {attempt_number}/{max_attempts}, "
-                                f"type={type(e).__name__}), will retry"
-                            )
-                            raise
-            except RetryError as e:
-                # tenacity 自身抛出的封装（仅当 reraise=False 时触发；我们已 reraise=True）
-                logger.error(f"Upstream exhausted {max_attempts} attempts: {e}")
-                raise
-            # 不可重试的异常（4xx 业务错误）会直接抛出，不进入 RetryError 分支
+            async for attempt in AsyncRetrying(
+                stop=stop_after_attempt(max_attempts),
+                wait=wait_exponential(
+                    multiplier=settings.retry_base_delay,
+                    exp_base=2,
+                    min=settings.retry_base_delay,
+                    max=settings.retry_base_delay * (2 ** (max_attempts - 1)),
+                ),
+                retry=retry_if_exception_type(
+                    RETRYABLE_EXCEPTIONS + (UpstreamRetryableError,)
+                ),
+                reraise=True,
+            ):
+                with attempt:
+                    attempt_number = attempt.retry_state.attempt_number
+                    try:
+                        return await fn(*args, **kwargs)
+                    except UpstreamRetryableError as e:
+                        logger.warning(
+                            f"Upstream retryable error "
+                            f"(attempt {attempt_number}/{max_attempts}, "
+                            f"status={e.response.status_code}), "
+                            f"will retry"
+                        )
+                        raise
+                    except RETRYABLE_EXCEPTIONS as e:
+                        logger.warning(
+                            f"Upstream network error "
+                            f"(attempt {attempt_number}/{max_attempts}, "
+                            f"type={type(e).__name__}), will retry"
+                        )
+                        raise
+            # reraise=True 时，重试耗尽会直接抛出最后一次异常；
+            # 不可重试的异常（4xx 业务错误）也会直接抛出。
 
         return wrapper
 

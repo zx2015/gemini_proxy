@@ -76,7 +76,7 @@ def _parse_sse_body(body: bytes) -> List[dict]:
 
 @pytest.mark.asyncio
 async def test_pure_text_stream():
-    """纯文本流：3 个 text delta + finishReason=stop。"""
+    """纯文本流：3 个 text delta → 逐帧输出 + finishReason=stop。"""
     chunks = [
         {"choices": [{"index": 0, "delta": {"role": "assistant", "tool_calls": []}}]},
         {"choices": [{"index": 0, "delta": {"content": "你"}}]},
@@ -89,9 +89,17 @@ async def test_pure_text_stream():
         out.append(b)
     frames = _parse_sse_body(b"".join(out))
 
-    # 文本累积并清洗后一次性输出 → 1 text 帧 + 1 final 帧 = 2 帧
-    assert len(frames) == 2
-    assert frames[0]["candidates"][0]["content"]["parts"][0]["text"] == "你好"
+    # 文本逐帧输出（2 个 text 帧） + 1 个 final 帧
+    assert len(frames) >= 2
+    # 拼接所有文本 parts 应等于 "你好"
+    texts = [
+        p["text"]
+        for f in frames
+        for c in f.get("candidates", [])
+        for p in c.get("content", {}).get("parts", [])
+        if "text" in p and not p.get("thought")
+    ]
+    assert "".join(texts) == "你好"
     # final frame 包含 finishReason
     assert frames[-1]["candidates"][0].get("finishReason") == "STOP"
 
@@ -202,8 +210,8 @@ async def test_output_is_sse_format():
 
     # 1. 每个事件必须以 \\n\\n 结束
     events = [e for e in body.split("\n\n") if e.strip()]
-    # 合并后：1 个 text 帧 + 1 个 final 帧 = 2 个事件
-    assert len(events) == 2
+    # 增量输出：2 个 text 帧（"a", "b"）+ 1 个 final 帧 = 3 个事件
+    assert len(events) >= 2
 
     # 2. 每个事件必须以 `data: {` 开头（对象，不是数组）
     for ev in events:

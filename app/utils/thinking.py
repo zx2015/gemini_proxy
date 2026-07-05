@@ -8,8 +8,14 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List, Optional
 
-# 支持匹配各种推理标签的开标签和闭标签
+# 支持匹配各种推理标签的开标签（仅用于判断文本是否以推理标签开头）
 _OPEN_TAGS_RE = re.compile(r"^<(think|thinking|reflection|reasoning|antml:thinking)\b[^>]*>", re.IGNORECASE)
+
+# 支持匹配文本任意位置出现的成对推理标签块（用于非流式完整文本的多块解析）
+_THINK_BLOCK_RE = re.compile(
+    r"<(think|thinking|reflection|reasoning|antml:thinking)\b[^>]*>(.*?)</\1\s*>",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 def strip_thinking(text: str) -> str:
@@ -33,10 +39,19 @@ def parse_thinking_segments(
     text: Optional[str],
     reasoning_content: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    """将文本中的各种推理标签内容提取，转换为 Gemini 规范的 parts 结构。"""
-    parts = []
+    """将文本中的各种推理标签内容提取，转换为 Gemini 规范的 parts 结构。
 
-    # 1. 如果上游直接返回了独立的 reasoning_content (例如 DeepSeek)
+    行为：
+      1. 若上游返回独立的 reasoning_content（如 DeepSeek），优先作为首个 thought 段。
+      2. 解析文本中**任意位置**出现的成对推理标签块（支持多个块），
+         块内容作为 thought 段，块外文本作为普通 text 段，顺序保留。
+      3. 若文本以推理开标签开头但未闭合（流式残留），剩余部分整体作为 thought。
+      4. 无任何推理标签时，整段作为普通 text 返回。
+    """
+    parts: List[Dict[str, Any]] = []
+
+    # 1. 独立 reasoning_content：作为首个 thought 段；
+    #    此时文本内容不再二次解析思考标签，保持字面（避免与已提供的推理内容重复）。
     if reasoning_content:
         parts.append({"thought": True, "text": reasoning_content})
         if text:
@@ -44,37 +59,39 @@ def parse_thinking_segments(
         return parts
 
     if not text:
-        return []
+        return parts
 
-    # 2. 仅当文本以支持的推理标签开头时才解析为推理块，避免误伤正文中的字面讨论
+    # 2. 解析任意位置的成对推理标签块
+    last_end = 0
+    matched_any = False
+    for m in _THINK_BLOCK_RE.finditer(text):
+        matched_any = True
+        # 块前的普通文本
+        before = text[last_end:m.start()]
+        if before.strip():
+            parts.append({"text": before})
+        # 块内思考内容
+        thought_val = m.group(2)
+        if thought_val.strip():
+            parts.append({"thought": True, "text": thought_val})
+        last_end = m.end()
+
+    if matched_any:
+        # 最后一个块之后的普通文本
+        tail = text[last_end:]
+        if tail.strip():
+            parts.append({"text": tail.lstrip("\n\r \t")})
+        return parts
+
+    # 3. 未闭合的开标签（仅当出现在文本开头时按 thought 处理）
     stripped_text = text.lstrip()
     match_open = _OPEN_TAGS_RE.match(stripped_text)
     if match_open:
-        tag_name = match_open.group(1)
-        open_tag_len = match_open.end()
-        # 匹配对应的闭标签
-        close_tag_re = re.compile(rf"</{re.escape(tag_name)}\s*>", re.IGNORECASE)
-        close_tag_match = close_tag_re.search(stripped_text)
-        if close_tag_match:
-            close_start = close_tag_match.start()
-            close_end = close_tag_match.end()
-            
-            thought_val = stripped_text[open_tag_len:close_start]
-            normal_val = stripped_text[close_end:]
-            
-            if thought_val:
-                parts.append({"thought": True, "text": thought_val})
-            if normal_val:
-                normal_val = normal_val.lstrip("\n\r \t")
-                if normal_val:
-                    parts.append({"text": normal_val})
-        else:
-            # 未闭合的标签，整个剩下的部分都是 thought
-            thought_val = stripped_text[open_tag_len:]
-            if thought_val:
-                parts.append({"thought": True, "text": thought_val})
+        thought_val = stripped_text[match_open.end():]
+        if thought_val:
+            parts.append({"thought": True, "text": thought_val})
         return parts
 
-    # 否则，不以推理开标签开头，整个文本作为普通文本返回
+    # 4. 普通文本
     parts.append({"text": text})
     return parts

@@ -8,7 +8,7 @@ import json
 from typing import Any, Dict, List, Optional
 
 from app.services.transformer import fields
-from app.utils.thinking import parse_thinking_segments, strip_thinking
+from app.utils.thinking import parse_thinking_segments
 
 
 class ResponseTransformer:

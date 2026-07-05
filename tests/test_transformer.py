@@ -135,7 +135,42 @@ class TestRequestTransformation:
             "generationConfig": {"responseMimeType": "application/json"},
         }
         out = request_transformer.transform(gemini)
-        assert out["response_format"] == {"type": "json"}
+        assert out["response_format"] == {"type": "json_object"}
+
+    def test_json_object_injects_hint_when_missing(self):
+        # 消息中不含 "json" 时，应补一条 system 提示以兼容上游校验
+        gemini = {
+            "contents": [{"role": "user", "parts": [{"text": "给我数据"}]}],
+            "generationConfig": {"responseMimeType": "application/json"},
+        }
+        out = request_transformer.transform(gemini)
+        assert out["response_format"] == {"type": "json_object"}
+        joined = " ".join(
+            m["content"] for m in out["messages"] if isinstance(m.get("content"), str)
+        )
+        assert "json" in joined.lower()
+        assert out["messages"][0]["role"] == "system"
+
+    def test_json_object_appends_to_existing_system(self):
+        gemini = {
+            "systemInstruction": {"parts": [{"text": "你是助手"}]},
+            "contents": [{"role": "user", "parts": [{"text": "给我数据"}]}],
+            "generationConfig": {"responseMimeType": "application/json"},
+        }
+        out = request_transformer.transform(gemini)
+        sys_msgs = [m for m in out["messages"] if m["role"] == "system"]
+        assert len(sys_msgs) == 1
+        assert "你是助手" in sys_msgs[0]["content"]
+        assert "json" in sys_msgs[0]["content"].lower()
+
+    def test_json_object_no_duplicate_hint_when_present(self):
+        # 用户提示已含 "json" 时，不应再注入额外 system 消息
+        gemini = {
+            "contents": [{"role": "user", "parts": [{"text": "return json please"}]}],
+            "generationConfig": {"responseMimeType": "application/json"},
+        }
+        out = request_transformer.transform(gemini)
+        assert all(m["role"] != "system" for m in out["messages"])
 
     def test_function_declarations_flattened(self):
         gemini = {
@@ -195,6 +230,23 @@ class TestRequestTransformation:
         assert msg["content"][0] == {"type": "text", "text": "看图："}
         assert msg["content"][1]["type"] == "image_url"
         assert msg["content"][1]["image_url"]["url"] == "data:image/png;base64,BASE64DATA"
+
+    def test_inline_data_trailing_text_preserves_order(self):
+        """图片后面跟着文字时，顺序应保留（图→文），不能被提前到图片前。"""
+        gemini = {
+            "contents": [{
+                "role": "user",
+                "parts": [
+                    {"inline_data": {"mime_type": "image/png", "data": "BASE64DATA"}},
+                    {"text": "这张图里有什么？"},
+                ],
+            }],
+        }
+        out = request_transformer.transform(gemini)
+        msg = out["messages"][0]
+        assert isinstance(msg["content"], list)
+        assert msg["content"][0]["type"] == "image_url"
+        assert msg["content"][1] == {"type": "text", "text": "这张图里有什么？"}
 
     def test_function_call_in_parts(self):
         gemini = {

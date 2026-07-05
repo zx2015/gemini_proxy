@@ -10,6 +10,7 @@ import uvicorn
 from fastapi import FastAPI
 
 from app.api import gemini
+from app.api.gemini import close_upstream_client
 from app.core.config import settings
 from app.core.logging import logger, setup_logging
 from app.services.discovery import model_discovery
@@ -26,6 +27,7 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         await model_discovery.close()
+        await close_upstream_client()
         logger.info("gemini_proxy shutdown complete.")
 
 

@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import Any, Dict, List, Optional
 
@@ -21,6 +22,7 @@ class ModelDiscoveryService:
         self._cache: List[Dict[str, Any]] = []
         self._cache_time: float = 0.0
         self._gemini_cache: List[Dict[str, Any]] = []
+        self._lock: asyncio.Lock = asyncio.Lock()
 
     async def _ensure_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
@@ -36,30 +38,38 @@ class ModelDiscoveryService:
         self._client = None
 
     async def get_gemini_models(self) -> List[Dict[str, Any]]:
-        """返回 Gemini `models[]` 格式的模型列表（带缓存）。"""
+        """返回 Gemini `models[]` 格式的模型列表（带缓存，加锁防雷群效应）。"""
         now = time.time()
         ttl = settings.model_discovery_cache_ttl
+
+        # 快速路径：缓存有效，无需加锁
         if self._gemini_cache and ttl > 0 and (now - self._cache_time) < ttl:
             return self._gemini_cache
 
-        try:
-            client = await self._ensure_client()
-            resp = await client.get(
-                "/v1/models",
-                headers={"Authorization": f"Bearer {settings.upstream_api_key}"},
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            upstream_models = data.get("data", [])
-        except Exception as e:
-            logger.error(f"Failed to fetch models from upstream: {e}")
-            # 兜底：返回至少包含 UPSTREAM_MODEL 的列表
-            upstream_models = [{"id": settings.upstream_model, "object": "model"}]
+        async with self._lock:
+            # 重新检查（另一个协程可能已经刷新完成）
+            now = time.time()
+            if self._gemini_cache and ttl > 0 and (now - self._cache_time) < ttl:
+                return self._gemini_cache
 
-        self._cache = upstream_models
-        self._gemini_cache = [self._to_gemini_model(m) for m in upstream_models]
-        self._cache_time = now
-        return self._gemini_cache
+            try:
+                client = await self._ensure_client()
+                resp = await client.get(
+                    "/v1/models",
+                    headers={"Authorization": f"Bearer {settings.upstream_api_key}"},
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                upstream_models = data.get("data", [])
+            except Exception as e:
+                logger.error(f"Failed to fetch models from upstream: {e}")
+                # 兜底：返回至少包含 UPSTREAM_MODEL 的列表
+                upstream_models = [{"id": settings.upstream_model, "object": "model"}]
+
+            self._cache = upstream_models
+            self._gemini_cache = [self._to_gemini_model(m) for m in upstream_models]
+            self._cache_time = time.time()
+            return self._gemini_cache
 
     @staticmethod
     def _to_gemini_model(openai_model: Dict[str, Any]) -> Dict[str, Any]:

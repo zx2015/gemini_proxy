@@ -80,7 +80,7 @@ def map_tool_config_mode(mode: str) -> Optional[str]:
 # ---- responseMimeType → response_format.type ----
 
 MIME_TO_RESPONSE_FORMAT: Dict[str, str] = {
-    "application/json": "json",
+    "application/json": "json_object",
     "text/plain": "text",
 }
 
@@ -142,10 +142,6 @@ def extract_text_from_parts(parts: List[Dict[str, Any]]) -> str:
     for p in parts or []:
         if not isinstance(p, dict):
             continue
-        # 优先按 "text" 字段识别（Gemini 官方格式）
         if "text" in p and p.get("type", "text") == "text":
-            chunks.append(str(p["text"]))
-        # 退化：仅当 type 显式为 "text" 时才采用
-        elif p.get("type") == "text" and "text" in p:
             chunks.append(str(p["text"]))
     return "\n".join(chunks)

@@ -1,27 +1,40 @@
-"""流式响应处理器：OpenAI SSE → Gemini JSON 数组流。
+"""流式响应处理器：OpenAI SSE → Gemini SSE 帧流（状态机增量输出）。
 
 按 docs/design/stream_handler.md 规范实现。
 
-关键设计：
-  - 默认输出数组流格式：[\\n{...},\\n{...}\\n]
-  - 不重试（流式重试会让客户端拿到重复 chunk）
+关键设计（v0.2.0 起）：
+  - 文本 delta 在非思考模式下**立即**逐帧输出，不再全量缓冲，保证流式延迟最优。
+  - 思考内容检测（inline think tags）：
+      detecting  → 探测文本开头是否有 <think> 等标签（仅在流的最开始阶段）
+      in_think   → 已进入思考块，缓冲直到闭标签
+      streaming  → 普通文本，每个 delta 立即输出
+  - reasoning_content（DeepSeek 风格）：
+      全量缓冲；当第一个 content delta 到来时先输出 thought 帧再输出文本帧，
+      保证推理内容始终出现在回答内容之前。
   - tool_calls 多 chunk 增量 → 在收尾时一次性输出 functionCall
-  - 数组流首帧输出 `[`，中间帧以 `,\\n` 分隔，末帧 `]`
 """
 from __future__ import annotations
 
 import json
-from typing import AsyncGenerator, Dict, Any, Optional
-
-import httpx
+import re
+from typing import AsyncGenerator, Dict, Any, List, Optional
 
 from app.core.logging import logger
 from app.services.transformer import fields
-from app.utils.thinking import parse_thinking_segments, strip_thinking
+
+
+# 支持的思考开标签正则（必须出现在文本开头）
+_OPEN_TAGS_RE = re.compile(
+    r"^<(think|thinking|reflection|reasoning|antml:thinking)\b[^>]*>",
+    re.IGNORECASE,
+)
+
+# 探测阶段最大缓冲字符数（超过此长度仍无法匹配则视为普通文本）
+_THINK_DETECT_CHARS = 30
 
 
 class StreamProcessor:
-    """将 OpenAI SSE 行流转换为 Gemini JSON 数组流。
+    """将 OpenAI SSE 行流转换为 Gemini SSE 帧流（增量输出）。
 
     使用方式：
         processor = StreamProcessor()
@@ -36,16 +49,25 @@ class StreamProcessor:
         self._last_usage: Optional[Dict[str, Any]] = None
         # 累积的最后一个 finish_reason
         self._last_finish_reason: Optional[str] = None
-        # 是否已输出首帧的 '['
-        self._bracket_emitted = False
-        # 是否已输出过至少一个数据帧（用于决定分隔符）
-        self._has_emitted_data = False
         # 是否已发送终止信号（流结束）
         self._closed = False
-        # 累积文本 delta，用于清理 <think>...</think>（可能跨 chunk）
-        self._text_acc: list[str] = []
-        # 累积推理文本 delta（如果是直接返回的 reasoning_content）
-        self._reasoning_acc: list[str] = []
+        # 流式错误标志
+        self._stream_error = False
+
+        # ---- 思考标签状态机（处理 inline <think>...</think>） ----
+        # detecting → streaming  （文本不以 <think> 开头）
+        # detecting → in_think   （文本以 <think> 开头）
+        # in_think  → streaming  （找到对应的 </think>）
+        self._think_state: str = "detecting"
+        self._think_tag_name: str = ""   # 当前标签名，用于构造闭标签正则
+        self._think_buffer: str = ""     # IN_THINK 阶段的缓冲
+        self._detect_buffer: str = ""    # DETECTING 阶段的缓冲
+
+        # ---- reasoning_content（DeepSeek 风格）----
+        # 累积尚未输出的 reasoning_content；一旦有正文 content 到来即刷新为 thought 帧。
+        # 采用「渐进式刷新」而非一次性锁：支持极个别模型交替推送 reasoning/content 时，
+        # 也能保证每段思考都排在其后续正文之前。
+        self._reasoning_acc: List[str] = []
 
     async def process(
         self,
@@ -53,23 +75,18 @@ class StreamProcessor:
     ) -> AsyncGenerator[bytes, None]:
         """处理 OpenAI SSE 行流，yield Gemini SSE 帧（bytes）。
 
-        输出格式（@google/genai SDK 期望的 SSE）：
-            data: [{...}]\\n\\n
-            data: [{...}]\\n\\n
-            data: [{...}]\\n\\n
-
-        关键：每个 data: 字段后是一个 **JSON 数组**（即使只有 1 个元素）。
-        不能输出原始的 JSON 数组流 "[\\n{...}\\n]\\n"，否则 SDK 会报
-        "Incomplete JSON segment at the end"。
+        文本 delta 立即输出；思考内容、tool_calls 和 finishReason 在合适时机输出。
 
         Args:
             line_iter: 来自 httpx response.aiter_lines() 的异步行迭代器。
         """
         try:
-            frames_buffer: list[Dict[str, Any]] = []
-
             async for raw_line in line_iter:
-                line = raw_line.strip() if isinstance(raw_line, str) else raw_line.decode("utf-8", errors="ignore").strip()
+                line = (
+                    raw_line.strip()
+                    if isinstance(raw_line, str)
+                    else raw_line.decode("utf-8", errors="ignore").strip()
+                )
                 if not line:
                     continue
                 if line == "data: [DONE]":
@@ -87,55 +104,105 @@ class StreamProcessor:
                     logger.warning(f"StreamProcessor: JSON decode failed, skip: {e}")
                     continue
 
-                # 上游流式错误（LiteLLM 偶发）→ 转 error 帧
+                # 上游流式错误（LiteLLM 偶发）→ 立即输出 error 帧并终止
                 if "error" in chunk and "choices" not in chunk:
                     logger.warning(f"StreamProcessor: upstream stream error: {chunk['error']}")
-                    frames_buffer.append({
+                    self._stream_error = True
+                    yield self._format_sse_frame({
                         "error": {
                             "code": 500,
                             "message": str(chunk["error"].get("message", "Upstream stream error")),
                             "status": "INTERNAL",
                         }
                     })
-                    self._stream_error = True
                     break
 
-                frame = self._build_gemini_frame(chunk)
-                if frame is not None:
-                    frames_buffer.append(frame)
+                # ---- usage（可能出现在无 choices 的尾部 chunk）----
+                if chunk.get("usage"):
+                    self._last_usage = chunk["usage"]
 
-            # 收尾：文本及推理内容解析后输出（保留 <think> 推理内容为 Gemini thought=True）
-            full_text = "".join(self._text_acc)
-            full_reasoning = "".join(self._reasoning_acc)
-            parsed_parts = parse_thinking_segments(full_text, full_reasoning if full_reasoning else None)
-            logger.info(f"StreamProcessor: end of stream text_len={len(full_text)} reasoning_len={len(full_reasoning)} parsed_parts_count={len(parsed_parts)}")
-            logger.debug(f"StreamProcessor: end of stream parsed_parts={parsed_parts}")
-            if parsed_parts:
-                frames_buffer.append({
-                    "candidates": [{
-                        "content": {
-                            "role": fields.ROLE_MODEL,
-                            "parts": parsed_parts,
-                        },
-                        "index": 0,
-                    }],
-                })
+                choices = chunk.get("choices")
+                if not choices:
+                    continue
 
-            # 收尾：tool_calls 一次性输出
+                choice = choices[0]
+                delta = choice.get("delta", {})
+
+                if choice.get("finish_reason"):
+                    self._last_finish_reason = choice["finish_reason"]
+
+                # ---- 累积 tool_calls（收尾时一次性输出）----
+                for tc_delta in delta.get("tool_calls", []) or []:
+                    idx = tc_delta.get("index", 0)
+                    slot = self._tool_calls_acc.setdefault(idx, {
+                        "id": None, "name": "", "arguments": "",
+                    })
+                    if tc_delta.get("id"):
+                        slot["id"] = tc_delta["id"]
+                    fn = tc_delta.get("function", {}) or {}
+                    if fn.get("name"):
+                        slot["name"] = (slot["name"] or "") + fn["name"]
+                    if fn.get("arguments"):
+                        slot["arguments"] = (slot["arguments"] or "") + fn["arguments"]
+
+                # ---- reasoning_content（DeepSeek 风格，全量缓冲）----
+                reasoning = delta.get("reasoning_content")
+                if reasoning:
+                    self._reasoning_acc.append(reasoning)
+
+                # ---- 文本 delta：状态机增量处理 ----
+                text = delta.get("content")
+                if text:
+                    # 渐进式刷新：只要此前累积了 reasoning_content，在正文到来前
+                    # 先打包输出一次 thought 帧并清空，保证「先思考、后回答」的顺序。
+                    # 对交替推送 reasoning/content 的模型同样成立。
+                    if self._reasoning_acc:
+                        full_reasoning = "".join(self._reasoning_acc)
+                        self._reasoning_acc = []
+                        logger.info(f"StreamProcessor: emitting reasoning thought len={len(full_reasoning)}")
+                        yield self._format_sse_frame(
+                            self._make_thought_frame_dict(full_reasoning)
+                        )
+                    # 通过状态机处理文本
+                    for frame_dict in self._process_text_delta(text):
+                        yield self._format_sse_frame(frame_dict)
+
+            # ==================================================================
+            # 收尾：按顺序输出残余内容
+            # ==================================================================
+
+            # 1. 探测缓冲未消费（流结束时仍处于 detecting 阶段，未见 <think>）→ 普通文本
+            if self._detect_buffer:
+                yield self._format_sse_frame(
+                    self._make_text_frame_dict(self._detect_buffer)
+                )
+                self._detect_buffer = ""
+
+            # 2. 思考缓冲未闭合（收到了 <think> 但没找到 </think>）→ 作为 thought 输出
+            if self._think_buffer:
+                yield self._format_sse_frame(
+                    self._make_thought_frame_dict(self._think_buffer)
+                )
+                self._think_buffer = ""
+
+            # 3. 未刷新的 reasoning_content：整个流只有推理没有 content，
+            #    或最后一段推理之后再无正文（收尾兜底）。
+            if self._reasoning_acc:
+                full_reasoning = "".join(self._reasoning_acc)
+                logger.info(f"StreamProcessor: emitting tail reasoning thought len={len(full_reasoning)}")
+                yield self._format_sse_frame(
+                    self._make_thought_frame_dict(full_reasoning)
+                )
+
+            # 4. tool_calls 一次性输出
             tool_frame = self._build_tool_call_frame()
             if tool_frame is not None:
-                frames_buffer.append(tool_frame)
+                yield self._format_sse_frame(tool_frame)
 
-            # 收尾：finishReason + usageMetadata
-            # 错误路径用 OTHER，正常路径用 STOP 作默认值
-            default_finish = "OTHER" if getattr(self, "_stream_error", False) else "STOP"
+            # 5. finishReason + usageMetadata（最后一帧）
+            default_finish = "OTHER" if self._stream_error else "STOP"
             final_frame = self._build_final_frame(default_finish=default_finish)
-            if final_frame is not None:
-                frames_buffer.append(final_frame)
-
-            # 统一以 SSE data: 格式输出（每帧一个元素包成数组）
-            for frame in frames_buffer:
-                yield self._format_sse_frame(frame)
+            yield self._format_sse_frame(final_frame)
 
             self._closed = True
 
@@ -143,71 +210,125 @@ class StreamProcessor:
             logger.error(f"StreamProcessor: unhandled error: {e}")
             if not self._closed:
                 try:
-                    err_frame = {
+                    yield self._format_sse_frame({
                         "error": {
                             "code": 500,
                             "message": f"Stream processing error: {e}",
                             "status": "INTERNAL",
                         }
-                    }
-                    yield self._format_sse_frame(err_frame)
+                    })
                 except Exception:
                     pass
             raise
 
     # ====================================================================
-    # 内部：帧构造
+    # 文本状态机
     # ====================================================================
 
-    def _build_gemini_frame(self, openai_chunk: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """从单个 OpenAI chunk 构造 Gemini 帧（仅 text delta / usage 累积 / finish_reason 记录）。"""
-        # ---- usage 可能出现在 choices 为空但带 usage 字段的尾部 chunk ----
-        if openai_chunk.get("usage"):
-            self._last_usage = openai_chunk["usage"]
+    def _process_text_delta(self, text: str) -> List[Dict[str, Any]]:
+        """将文本 delta 通过状态机处理，返回 0 或多个 Gemini 帧 dict。"""
+        if self._think_state == "streaming":
+            return [self._make_text_frame_dict(text)]
+        if self._think_state == "in_think":
+            return self._handle_in_think(text)
+        # detecting
+        return self._handle_detecting(text)
 
-        choices = openai_chunk.get("choices")
-        if not choices:
-            return None
+    def _handle_detecting(self, text: str) -> List[Dict[str, Any]]:
+        """探测阶段：判断文本是否以思考开标签开头。"""
+        self._detect_buffer += text
+        stripped = self._detect_buffer.lstrip()
 
-        choice = choices[0]
-        delta = choice.get("delta", {})
+        if not stripped:
+            return []
 
-        # ---- 记录 finish_reason ----
-        if choice.get("finish_reason"):
-            self._last_finish_reason = choice["finish_reason"]
+        # 首字符不是 '<' → 确定非思考标签，立即切换到 streaming 并输出
+        if stripped[0] != "<":
+            buf = self._detect_buffer
+            self._detect_buffer = ""
+            self._think_state = "streaming"
+            return [self._make_text_frame_dict(buf)]
 
-        # ---- 累积 tool_calls（不在本帧输出） ----
-        for tc_delta in delta.get("tool_calls", []) or []:
-            idx = tc_delta.get("index", 0)
-            slot = self._tool_calls_acc.setdefault(idx, {
-                "id": None, "name": "", "arguments": "",
-            })
-            if tc_delta.get("id"):
-                slot["id"] = tc_delta["id"]
-            fn = tc_delta.get("function", {}) or {}
-            if fn.get("name"):
-                slot["name"] = (slot["name"] or "") + fn["name"]
-            if fn.get("arguments"):
-                slot["arguments"] = (slot["arguments"] or "") + fn["arguments"]
+        # 尝试匹配完整的思考开标签
+        match = _OPEN_TAGS_RE.match(stripped)
+        if match:
+            self._think_state = "in_think"
+            self._think_tag_name = match.group(1)
+            remaining = stripped[match.end():]
+            self._detect_buffer = ""
+            self._think_buffer = remaining
+            # remaining 中可能已经含有闭标签
+            return self._handle_in_think("")
 
-        # ---- 文本增量 ----
-        text = delta.get("content")
+        # 以 '<' 开头但还不足以判断 → 继续缓冲，直到超过阈值
+        if len(stripped) > _THINK_DETECT_CHARS:
+            buf = self._detect_buffer
+            self._detect_buffer = ""
+            self._think_state = "streaming"
+            return [self._make_text_frame_dict(buf)]
+
+        return []
+
+    def _handle_in_think(self, text: str) -> List[Dict[str, Any]]:
+        """思考块内：缓冲直到找到对应的闭标签。"""
         if text:
-            # 注意：MiniMax/M3 等模型会输出 <think>...</think>，且标签可能跨 chunk。
-            # 为避免泄漏思考链，流式路径先累积文本，收尾时统一解析后输出。
-            self._text_acc.append(text)
+            self._think_buffer += text
 
-        reasoning = delta.get("reasoning_content")
-        if reasoning:
-            self._reasoning_acc.append(reasoning)
-        return None
+        close_re = re.compile(
+            rf"</{re.escape(self._think_tag_name)}\s*>",
+            re.IGNORECASE,
+        )
+        m = close_re.search(self._think_buffer)
+        if m is None:
+            return []  # 还没找到闭标签，继续缓冲
+
+        thought_text = self._think_buffer[:m.start()]
+        after_text = self._think_buffer[m.end():].lstrip("\n\r \t")
+        self._think_state = "streaming"
+        self._think_buffer = ""
+        self._think_tag_name = ""
+
+        frames: List[Dict[str, Any]] = []
+        if thought_text:
+            frames.append(self._make_thought_frame_dict(thought_text))
+        if after_text:
+            frames.append(self._make_text_frame_dict(after_text))
+        return frames
+
+    # ====================================================================
+    # 帧构造工具
+    # ====================================================================
+
+    @staticmethod
+    def _make_text_frame_dict(text: str) -> Dict[str, Any]:
+        return {
+            "candidates": [{
+                "content": {
+                    "role": fields.ROLE_MODEL,
+                    "parts": [{"text": text}],
+                },
+                "index": 0,
+            }],
+        }
+
+    @staticmethod
+    def _make_thought_frame_dict(thought: str) -> Dict[str, Any]:
+        return {
+            "candidates": [{
+                "content": {
+                    "role": fields.ROLE_MODEL,
+                    "parts": [{"thought": True, "text": thought}],
+                },
+                "index": 0,
+            }],
+        }
 
     def _build_tool_call_frame(self) -> Optional[Dict[str, Any]]:
         """收尾时一次性输出累积的 tool_calls。"""
         if not self._tool_calls_acc:
             return None
 
-        parts: list[Dict[str, Any]] = []
+        parts: List[Dict[str, Any]] = []
         for idx in sorted(self._tool_calls_acc.keys()):
             slot = self._tool_calls_acc[idx]
             name = slot.get("name") or ""
@@ -233,13 +354,8 @@ class StreamProcessor:
             }],
         }
 
-    def _build_final_frame(self, default_finish: str = "OTHER") -> Optional[Dict[str, Any]]:
-        """收尾：finishReason + usageMetadata。
-
-        Args:
-            default_finish: 当上游未发送 finish_reason 时的默认值。
-                            路由层传 "STOP"，错误路径传 "OTHER"。
-        """
+    def _build_final_frame(self, default_finish: str = "OTHER") -> Dict[str, Any]:
+        """收尾帧：finishReason + usageMetadata。"""
         candidate: Dict[str, Any] = {
             "content": {"role": fields.ROLE_MODEL, "parts": []},
             "index": 0,
@@ -252,11 +368,13 @@ class StreamProcessor:
                 has_tool_calls=bool(self._tool_calls_acc),
             )
         else:
-            # 默认值：保证 Gemini 客户端能识别流已结束
             candidate["finishReason"] = default_finish
 
-        logger.info(f"StreamProcessor: stream complete last_finish_reason={self._last_finish_reason} default_finish={default_finish}")
-        logger.debug(f"StreamProcessor: final_frame={frame}")
+        logger.info(
+            f"StreamProcessor: stream complete "
+            f"last_finish_reason={self._last_finish_reason} "
+            f"default_finish={default_finish}"
+        )
         if self._last_usage:
             frame["usageMetadata"] = {
                 "promptTokenCount": self._last_usage.get("prompt_tokens", 0),
@@ -269,10 +387,10 @@ class StreamProcessor:
     def _format_sse_frame(self, frame: Dict[str, Any]) -> bytes:
         """将 Gemini 帧格式化为标准的 SSE `data:` 帧。
 
-        格式：data: {"candidates": [...]}\\n\\n
+        格式：data: {...}\\n\\n
         - 必须是 JSON 对象（@google/genai SDK 期望，不能用数组包）
         - 末尾必须有 \\n\\n（SSE 事件分隔符）
         """
         body = json.dumps(frame, ensure_ascii=False).encode("utf-8")
-        self._has_emitted_data = True
         return b"data: " + body + b"\n\n"
+

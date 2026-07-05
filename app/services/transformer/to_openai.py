@@ -101,7 +101,7 @@ class RequestTransformer:
                     msg["content"] = "\n".join(text_chunks)
                 elif content_items:
                     if text_chunks:
-                        content_items.insert(0, {
+                        content_items.append({
                             "type": "text",
                             "text": "\n".join(text_chunks),
                         })
@@ -134,7 +134,40 @@ class RequestTransformer:
             if choice is not None:
                 openai_req["tool_choice"] = choice
 
+        # ---- 6. json_object 兼容性补齐 ----
+        # 许多上游模型要求：启用 response_format=json_object 时，
+        # 提示（system/user）中必须显式出现 "json" 一词，否则直接报错。
+        # 若客户端未在提示里带上该词，则在 system 消息中补一句说明。
+        self._ensure_json_hint(openai_req)
+
         return openai_req
+
+    @staticmethod
+    def _ensure_json_hint(openai_req: Dict[str, Any]) -> None:
+        rf = openai_req.get("response_format")
+        if not (isinstance(rf, dict) and rf.get("type") == "json_object"):
+            return
+
+        def _contains_json(content: Any) -> bool:
+            if isinstance(content, str):
+                return "json" in content.lower()
+            if isinstance(content, list):
+                for it in content:
+                    if isinstance(it, dict) and "json" in str(it.get("text", "")).lower():
+                        return True
+            return False
+
+        messages = openai_req.get("messages", [])
+        if any(_contains_json(m.get("content")) for m in messages):
+            return
+
+        hint = "Please respond with a valid JSON object."
+        for m in messages:
+            if m.get("role") == fields.ROLE_SYSTEM and isinstance(m.get("content"), str):
+                m["content"] = f"{m['content']}\n\n{hint}"
+                return
+        # 没有可复用的 system 消息 → 在最前插入一条
+        messages.insert(0, {"role": fields.ROLE_SYSTEM, "content": hint})
 
     # ====================================================================
     # 内部工具

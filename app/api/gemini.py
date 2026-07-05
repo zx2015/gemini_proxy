@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Optional
+from typing import Any, Dict, Optional
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Path, Request, status
@@ -26,7 +26,7 @@ from app.services.discovery import model_discovery
 from app.services.stream.processor import StreamProcessor
 from app.services.transformer.from_openai import response_transformer
 from app.services.transformer.to_openai import request_transformer
-from app.utils.error_handler import build_gemini_error, handle_upstream_error
+from app.utils.error_handler import build_gemini_error, handle_upstream_error, map_http_status_to_gemini_status
 from app.utils.retry import (
     UpstreamRetryableError,
     _raise_if_retryable_status,
@@ -35,6 +35,28 @@ from app.utils.retry import (
 
 
 router = APIRouter()
+
+# 模块级共享 AsyncClient（连接池复用，延迟初始化）
+_upstream_client: Optional[httpx.AsyncClient] = None
+
+
+def _get_upstream_client() -> httpx.AsyncClient:
+    """返回模块级共享的 AsyncClient，首次调用时创建。"""
+    global _upstream_client
+    if _upstream_client is None or _upstream_client.is_closed:
+        _upstream_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(settings.request_timeout),
+            limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
+        )
+    return _upstream_client
+
+
+async def close_upstream_client() -> None:
+    """关闭共享 AsyncClient（在 lifespan 关闭阶段调用）。"""
+    global _upstream_client
+    if _upstream_client and not _upstream_client.is_closed:
+        await _upstream_client.aclose()
+    _upstream_client = None
 
 
 # ====================================================================
@@ -62,14 +84,14 @@ async def generate_content(
         "Authorization": f"Bearer {settings.upstream_api_key}",
         "Content-Type": "application/json",
     }
-    client_timeout = httpx.Timeout(settings.request_timeout)
+
 
     @get_retry_decorator()
-    async def _call_upstream() -> Dict:
-        async with httpx.AsyncClient(timeout=client_timeout) as client:
-            resp = await client.post(upstream_url, json=openai_body, headers=upstream_headers)
-            _raise_if_retryable_status(resp)  # 5xx/429 → 抛 UpstreamRetryableError
-            return resp.json()
+    async def _call_upstream() -> Dict[str, Any]:
+        client = _get_upstream_client()
+        resp = await client.post(upstream_url, json=openai_body, headers=upstream_headers)
+        _raise_if_retryable_status(resp)  # 5xx/429 → 抛 UpstreamRetryableError
+        return resp.json()
 
     try:
         openai_resp = await _call_upstream()
@@ -116,10 +138,10 @@ async def stream_generate_content(
         "Authorization": f"Bearer {settings.upstream_api_key}",
         "Content-Type": "application/json",
     }
-    client_timeout = httpx.Timeout(settings.request_timeout)
+
 
     async def event_generator():
-        client = httpx.AsyncClient(timeout=client_timeout)
+        client = _get_upstream_client()
         try:
             async with client.stream(
                 "POST", upstream_url, json=openai_body, headers=upstream_headers
@@ -140,7 +162,7 @@ async def stream_generate_content(
                         "error": {
                             "code": resp.status_code,
                             "message": msg,
-                            "status": "UNKNOWN",
+                            "status": map_http_status_to_gemini_status(resp.status_code),
                         }
                     }
                     yield ("data: " + json.dumps(err_frame, ensure_ascii=False) + "\n\n").encode("utf-8")
@@ -162,8 +184,8 @@ async def stream_generate_content(
                 }
             }
             yield ("data: " + json.dumps(err_frame, ensure_ascii=False) + "\n\n").encode("utf-8")
-        finally:
-            await client.aclose()
+
+
 
     return StreamingResponse(
         event_generator(),

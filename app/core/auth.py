@@ -8,6 +8,7 @@
 任一位置凭据匹配 `settings.proxy_api_key` 即视为通过。
 """
 from __future__ import annotations
+import hmac
 
 from typing import Optional
 
@@ -50,7 +51,7 @@ async def verify_api_key(request: Request) -> str:
                    "Authorization: Bearer header, or ?key= query param.",
         )
 
-    if token != settings.proxy_api_key:
+    if not hmac.compare_digest(token, settings.proxy_api_key):
         logger.warning(f"Auth failed (invalid key) from {client_ip} {request.url.path}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
