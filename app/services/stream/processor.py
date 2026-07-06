@@ -17,10 +17,15 @@ from __future__ import annotations
 
 import json
 import re
-from typing import AsyncGenerator, Dict, Any, List, Optional
+from typing import AsyncGenerator, Dict, Any, List, Optional, Set
 
+from app.core.config import settings
 from app.core.logging import logger
 from app.services.transformer import fields
+from app.utils.minimax_tool_markup import (
+    contains_minimax_markup,
+    consume_minimax_markup_chunks,
+)
 
 
 # 支持的思考开标签正则（必须出现在文本开头）
@@ -68,6 +73,11 @@ class StreamProcessor:
         # 采用「渐进式刷新」而非一次性锁：支持极个别模型交替推送 reasoning/content 时，
         # 也能保证每段思考都排在其后续正文之前。
         self._reasoning_acc: List[str] = []
+        # ---- MiniMax tool_call 文本泄漏恢复（防御性）----
+        self._minimax_model_hint: bool = "minimax" in settings.upstream_model.lower()
+        self._minimax_markup_buffer: str = ""
+        self._recovered_tool_call_indexes: Set[int] = set()
+        self._saw_structured_tool_calls: bool = False
 
     async def process(
         self,
@@ -133,6 +143,12 @@ class StreamProcessor:
 
                 # ---- 累积 tool_calls（收尾时一次性输出）----
                 for tc_delta in delta.get("tool_calls", []) or []:
+                    # 一旦观察到标准结构化 tool_calls，优先信任它并丢弃先前的恢复结果，避免重复。
+                    if not self._saw_structured_tool_calls:
+                        self._saw_structured_tool_calls = True
+                        for ridx in list(self._recovered_tool_call_indexes):
+                            self._tool_calls_acc.pop(ridx, None)
+                        self._recovered_tool_call_indexes.clear()
                     idx = tc_delta.get("index", 0)
                     slot = self._tool_calls_acc.setdefault(idx, {
                         "id": None, "name": "", "arguments": "",
@@ -153,10 +169,26 @@ class StreamProcessor:
                 # ---- 文本 delta：状态机增量处理 ----
                 text = delta.get("content")
                 if text:
+                    # MiniMax 防御恢复：上游若将 tool_call 泄漏在 content 文本中，
+                    # 则提取成结构化调用并从文本中清理。
+                    if settings.minimax_tool_markup_recovery and (
+                        self._minimax_model_hint
+                        or self._minimax_markup_buffer
+                        or contains_minimax_markup(text)
+                    ):
+                        clean_text, recovered_calls, new_buffer = consume_minimax_markup_chunks(
+                            self._minimax_markup_buffer,
+                            text,
+                        )
+                        self._minimax_markup_buffer = new_buffer
+                        if recovered_calls and not self._saw_structured_tool_calls:
+                            self._append_recovered_tool_calls(recovered_calls)
+                        text = clean_text
+
                     # 渐进式刷新：只要此前累积了 reasoning_content，在正文到来前
                     # 先打包输出一次 thought 帧并清空，保证「先思考、后回答」的顺序。
                     # 对交替推送 reasoning/content 的模型同样成立。
-                    if self._reasoning_acc:
+                    if text and self._reasoning_acc:
                         full_reasoning = "".join(self._reasoning_acc)
                         self._reasoning_acc = []
                         logger.info(f"StreamProcessor: emitting reasoning thought len={len(full_reasoning)}")
@@ -164,14 +196,21 @@ class StreamProcessor:
                             self._make_thought_frame_dict(full_reasoning)
                         )
                     # 通过状态机处理文本
-                    for frame_dict in self._process_text_delta(text):
-                        yield self._format_sse_frame(frame_dict)
+                    if text:
+                        for frame_dict in self._process_text_delta(text):
+                            yield self._format_sse_frame(frame_dict)
 
             # ==================================================================
             # 收尾：按顺序输出残余内容
             # ==================================================================
 
             # 1. 探测缓冲未消费（流结束时仍处于 detecting 阶段，未见 <think>）→ 普通文本
+            if self._minimax_markup_buffer:
+                # 若末尾仍有未闭合 MiniMax 标记，按普通文本回传，避免内容丢失。
+                for frame_dict in self._process_text_delta(self._minimax_markup_buffer):
+                    yield self._format_sse_frame(frame_dict)
+                self._minimax_markup_buffer = ""
+
             if self._detect_buffer:
                 yield self._format_sse_frame(
                     self._make_text_frame_dict(self._detect_buffer)
@@ -354,6 +393,23 @@ class StreamProcessor:
             }],
         }
 
+    def _append_recovered_tool_calls(self, recovered_calls: List[Dict[str, Any]]) -> None:
+        """将恢复出的 MiniMax 文本 tool_call 追加到内部聚合槽。"""
+        next_idx = (max(self._tool_calls_acc.keys()) + 1) if self._tool_calls_acc else 0
+        for offset, call in enumerate(recovered_calls):
+            idx = next_idx + offset
+            args = call.get("args", {})
+            if isinstance(args, str):
+                args_payload = args
+            else:
+                args_payload = json.dumps(args, ensure_ascii=False)
+            self._tool_calls_acc[idx] = {
+                "id": f"call_recovered_{idx}",
+                "name": str(call.get("name", "")),
+                "arguments": args_payload,
+            }
+            self._recovered_tool_call_indexes.add(idx)
+
     def _build_final_frame(self, default_finish: str = "OTHER") -> Dict[str, Any]:
         """收尾帧：finishReason + usageMetadata。"""
         candidate: Dict[str, Any] = {
@@ -393,4 +449,3 @@ class StreamProcessor:
         """
         body = json.dumps(frame, ensure_ascii=False).encode("utf-8")
         return b"data: " + body + b"\n\n"
-

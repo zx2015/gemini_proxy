@@ -6,6 +6,7 @@
 > 修订记录：
 > - 2026-07-02：v0.1.0 初稿
 > - 2026-07-02：v0.1.0-r1 §1.2 字段映射表删除 `MODEL_MAPPING` 行；新增 §1.9 强制模型覆盖实现细节
+> - 2026-07-06：v0.1.1-r1 新增 MiniMax M3 文本内嵌 tool_call 恢复策略（§2.6）
 >
 > 本文档是 `app/services/transformer/` 下的实现规范。代码编写时必须以本文档为准；任何偏离都需要**先更新文档**再实现。
 
@@ -49,7 +50,7 @@ response_transformer = ResponseTransformer()
 | `generationConfig.topK` | — | **丢弃**（OpenAI 无对应字段），记录到 debug 日志 |
 | `generationConfig.stopSequences` | `stop` | 数组 / 字符串直接透传 |
 | `generationConfig.candidateCount` | `n` | 直接映射 |
-| `generationConfig.responseMimeType` | `response_format.type` | `application/json` → `json`；`text/plain` → `text` |
+| `generationConfig.responseMimeType` | `response_format.type` | `application/json` → `json_object`；`text/plain` → `text` |
 | `safetySettings` | — | 丢弃（OpenAI 无对应安全分类器） |
 | `tools[].functionDeclarations` | `tools[].function` | 见 [§1.4](#14-tools--functiondeclarations--toolsfunction) |
 | `toolConfig.functionCallingConfig.mode` | `tool_choice` | 见 [§1.5](#15-toolconfig--tool_choice) |
@@ -360,6 +361,7 @@ def transform_from_openai(openai_resp: dict) -> dict:
 | `tool_calls[].function.arguments` 不是合法 JSON | 用原始字符串作为 `args`；记录 ERROR |
 | 上游无 `usage` 字段 | 返回的 Gemini 响应中不包含 `usageMetadata` |
 | 多 `choices`（`n > 1`） | 仅返回 `choices[0]`，其余丢弃（Gemini 无内建"多候选"语义），记录 WARN |
+| MiniMax M3 将工具调用以 `]<]minimax[>[<tool_call>...` 泄漏在 `message.content` | 当 `MINIMAX_TOOL_MARKUP_RECOVERY=true` 且（`model` 含 `minimax` 或文本命中命名空间标记）时：从 `content` 恢复 `functionCall`，并从文本中剥离该标记；若同时存在标准 `tool_calls`，优先标准字段，恢复结果仅用于文本清理 |
 
 ## 3. 错误归一化（响应方）
 
@@ -400,7 +402,8 @@ def transform_from_openai(openai_resp: dict) -> dict:
 | 函数声明（functionDeclarations） | 展平为 OpenAI tools |
 | 函数调用回传（functionResponse） | role="tool" + tool_call_id |
 | `toolConfig.mode="ANY"` | tool_choice="required" |
-| `generationConfig.responseMimeType="application/json"` | response_format.type="json" |
+| `generationConfig.responseMimeType="application/json"` | response_format.type="json_object" |
+| MiniMax M3 文本泄漏 tool_call（无 `tool_calls` 字段） | 可恢复为 `parts[].functionCall`，并清理泄漏文本 |
 | OpenAI 响应含 `tool_calls` | parts 含 `functionCall` |
 | `finish_reason="tool_calls"` | finishReason="STOP" + 含 functionCall |
 | `usage` 字段缺失 | 不输出 usageMetadata |

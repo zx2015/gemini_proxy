@@ -72,6 +72,13 @@ class Settings(BaseSettings):
         ge=0,
         description="上游 /v1/models 缓存秒数；0 表示不缓存",
     )
+    minimax_tool_markup_recovery: bool = Field(
+        True,
+        description=(
+            "是否启用 MiniMax 文本内嵌 tool_call 标记恢复。"
+            "开启后会尝试从 content 中提取 ]<]minimax[>[<tool_call>... 并恢复结构化工具调用。"
+        ),
+    )
 
     model_config = SettingsConfigDict(
         env_file=".env",

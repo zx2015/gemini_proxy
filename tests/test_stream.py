@@ -136,6 +136,70 @@ async def test_stream_with_tool_calls():
 
 
 @pytest.mark.asyncio
+async def test_stream_recovers_minimax_markup_tool_call():
+    chunks = [
+        {"choices": [{"index": 0, "delta": {"content": (
+            "]<]minimax[>[<tool_call>]"
+            "<]minimax[>[<invoke name=\"run_shell_command\">]"
+            "<]minimax[>[<command>pwd]<]minimax[>[</command>]"
+            "<]minimax[>[</invoke>]"
+            "<]minimax[>[</tool_call>"
+        )}}]},
+        {"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]},
+    ]
+    proc = StreamProcessor()
+    out: List[bytes] = []
+    async for b in proc.process(_sse_lines(chunks)):
+        out.append(b)
+    frames = _parse_sse_body(b"".join(out))
+
+    tool_frames = [
+        f for f in frames
+        if any("functionCall" in p for p in f.get("candidates", [{}])[0].get("content", {}).get("parts", []))
+    ]
+    assert len(tool_frames) == 1
+    fc = tool_frames[0]["candidates"][0]["content"]["parts"][0]["functionCall"]
+    assert fc["name"] == "run_shell_command"
+    assert fc["args"] == {"command": "pwd"}
+    leaked_texts = [
+        p["text"]
+        for f in frames
+        for c in f.get("candidates", [])
+        for p in c.get("content", {}).get("parts", [])
+        if "text" in p
+    ]
+    assert "".join(leaked_texts).strip() == ""
+
+
+@pytest.mark.asyncio
+async def test_stream_recovers_split_minimax_markup_tool_call():
+    chunks = [
+        {"choices": [{"index": 0, "delta": {"content": (
+            "]<]minimax[>[<tool_call>]"
+            "<]minimax[>[<invoke name=\"run_shell_command\">]"
+            "<]minimax[>[<command>ec"
+        )}}]},
+        {"choices": [{"index": 0, "delta": {"content": "ho minimax_probe]<]minimax[>[</command>"}}]},
+        {"choices": [{"index": 0, "delta": {"content": "]<]minimax[>[</invoke>]<]minimax[>[</tool_call>"}}]},
+        {"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]},
+    ]
+    proc = StreamProcessor()
+    out: List[bytes] = []
+    async for b in proc.process(_sse_lines(chunks)):
+        out.append(b)
+    frames = _parse_sse_body(b"".join(out))
+
+    tool_frames = [
+        f for f in frames
+        if any("functionCall" in p for p in f.get("candidates", [{}])[0].get("content", {}).get("parts", []))
+    ]
+    assert len(tool_frames) == 1
+    fc = tool_frames[0]["candidates"][0]["content"]["parts"][0]["functionCall"]
+    assert fc["name"] == "run_shell_command"
+    assert fc["args"] == {"command": "echo minimax_probe"}
+
+
+@pytest.mark.asyncio
 async def test_stream_with_usage_tail():
     """usage 末帧（choices 为空）→ usageMetadata 进入 final 帧。"""
     chunks = [

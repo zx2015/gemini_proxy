@@ -6,6 +6,7 @@
 > 修订记录（内容递增）：
 > - 2026-07-02：v0.1.0 初稿
 > - 2026-07-02：v0.1.0-r1 §1 修订——**纠正关键认知错误**：Gemini SDK 期望 SSE 格式而非"裸 JSON 数组流"；详见附录 A 与 `.learnings/experience/stream-sse-format-fix.md`
+> - 2026-07-06：v0.1.1-r1 新增 MiniMax M3 文本内嵌 tool_call 防御恢复（§5.4）
 >
 > 本文档是 `app/services/stream/processor.py` 的实现规范。
 
@@ -229,6 +230,21 @@ OpenAI 流的 `delta.tool_calls` 是**分片结构**，例：
 ```
 
 注意：`usageMetadata` 通常在 OpenAI 流的最末一个 chunk 才下发，且 chunk 形如 `{"usage": {...}, "choices": []}`。**必须**捕获这种"无 choices"的尾部 chunk。
+
+### 5.4 MiniMax M3 文本内嵌 tool_call 防御恢复
+
+当上游模型（或文本特征）命中 MiniMax M3 命名空间标记时，可能出现：
+
+```text
+]<]minimax[>[<tool_call> ... ]<]minimax[>[</tool_call>
+```
+
+恢复策略：
+1. 若 `MINIMAX_TOOL_MARKUP_RECOVERY=true` 且（`UPSTREAM_MODEL` 含 `minimax` 或 `delta.content` 命中标记），启动恢复流程。
+2. 从 `delta.content` 中提取完整 `<tool_call>/<invoke>` 块并解析参数，转入内部 `tool_calls_acc`。
+3. 同时从文本增量中剥离该标记，避免泄漏到用户可见文本。
+4. 若标记跨 chunk 被拆分，使用内部缓冲拼接；流结束仍未闭合则按原文本回传，避免数据丢失。
+5. 若流内出现标准 `delta.tool_calls`，优先标准字段并丢弃先前恢复结果，避免重复调用。
 
 ## 6. 错误处理
 

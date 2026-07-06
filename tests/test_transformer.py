@@ -437,3 +437,28 @@ class TestResponseTransformation:
         openai = {"choices": [{"message": {"role": "assistant", "content": "x"}, "finish_reason": "stop"}]}
         out = response_transformer.transform(openai)
         assert "usageMetadata" not in out
+
+    def test_minimax_markup_recovered_to_function_call(self):
+        openai = {
+            "model": "MiniMax/MiniMax-M3",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": (
+                        "]<]minimax[>[<tool_call>]"
+                        "<]minimax[>[<invoke name=\"run_shell_command\">]"
+                        "<]minimax[>[<command>pwd]<]minimax[>[</command>]"
+                        "<]minimax[>[</invoke>]"
+                        "<]minimax[>[</tool_call>"
+                    ),
+                    "tool_calls": None,
+                },
+                "finish_reason": "tool_calls",
+            }],
+        }
+        out = response_transformer.transform(openai)
+        parts = out["candidates"][0]["content"]["parts"]
+        assert all("text" not in p for p in parts)
+        fc = next(p["functionCall"] for p in parts if "functionCall" in p)
+        assert fc["name"] == "run_shell_command"
+        assert fc["args"] == {"command": "pwd"}
