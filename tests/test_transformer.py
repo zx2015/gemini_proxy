@@ -112,12 +112,12 @@ class TestRequestTransformation:
         assert out["n"] == 1
 
     def test_generation_config_default_max_tokens(self):
-        """若请求中没有 maxOutputTokens，默认补全为 32768。"""
+        """若请求中没有 maxOutputTokens，不向 OpenAI 请求中传递 max_tokens 字段。"""
         gemini = {
             "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
         }
         out = request_transformer.transform(gemini)
-        assert out["max_tokens"] == 32768
+        assert "max_tokens" not in out
 
     def test_topK_is_dropped(self):
         """OpenAI 无 topK，对应字段应被丢弃。"""

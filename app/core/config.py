@@ -49,6 +49,8 @@ class Settings(BaseSettings):
 
     # ---- 日志 ----
     log_level: str = "INFO"
+    debug_log_enabled: bool = Field(False, description="是否启用详细调试日志")
+    debug_log_path: str = Field("/app/logs/debug.log", description="调试日志文件路径")
 
     # ---- HTTP 行为 ----
     request_timeout: float = Field(

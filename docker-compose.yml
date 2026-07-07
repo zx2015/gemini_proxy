@@ -90,10 +90,11 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
-    # ---- 卷挂载 ----
     volumes:
       # 让 .learnings 持久化（容器重建不丢本地知识）
       - gemini-learnings:/app/.learnings
+      # 挂载调试日志目录
+      - ./logs:/app/logs
 
     # ---- 日志轮转（防磁盘爆满） ----
     logging:
@@ -128,6 +129,7 @@ services:
       # 开发模式：源码直接挂载进容器，编辑即生效
       - ./app:/app/app:ro
       - gemini-learnings:/app/.learnings
+      - ./logs:/app/logs
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:${PORT:-8000}/health"]
       interval: 30s

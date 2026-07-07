@@ -88,6 +88,37 @@ def setup_logging() -> None:
     # 安装 /health 过滤器
     logging.getLogger("uvicorn.access").addFilter(HealthCheckFilter())
 
+    # 初始化详细调试日志（隔离写入物理文件）
+    if settings.debug_log_enabled:
+        import os
+        from logging.handlers import RotatingFileHandler
+        
+        log_path = settings.debug_log_path
+        log_dir = os.path.dirname(log_path)
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
+            
+        debug_logger = logging.getLogger("gemini_debug")
+        debug_logger.setLevel(logging.DEBUG)
+        
+        # 避免在多次 setup_logging 调用时重复挂载 Handler
+        if not debug_logger.handlers:
+            # 20MB * 3 文件轮转
+            handler = RotatingFileHandler(
+                log_path,
+                maxBytes=20 * 1024 * 1024,
+                backupCount=2,
+                encoding="utf-8"
+            )
+            formatter = logging.Formatter(
+                fmt="%(asctime)s.%(msecs)03d %(levelname)-7s [%(name)s] %(message)s",
+                datefmt="%Y-%m-%dT%H:%M:%S"
+            )
+            handler.setFormatter(formatter)
+            debug_logger.addHandler(handler)
+            debug_logger.propagate = False
+
 
 # 业务代码统一通过此 logger 输出
 logger = logging.getLogger("gemini_proxy")
+logger_debug = logging.getLogger("gemini_debug")

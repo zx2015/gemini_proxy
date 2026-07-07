@@ -110,15 +110,11 @@ def map_generation_config(gen_config: Optional[Dict[str, Any]]) -> Dict[str, Any
     topK 等不存在的字段被丢弃（按 transformer.md §1.2）。
     """
     if not gen_config:
-        return {"max_tokens": 32768}
+        return {}
     out: Dict[str, Any] = {}
     for g_field, o_field in GENERATION_CONFIG_MAP.items():
         if g_field in gen_config:
             out[o_field] = gen_config[g_field]
-    
-    # 默认给一个充足的 max_tokens，避免上游使用极小的缺省值截断输出
-    if "max_tokens" not in out:
-        out["max_tokens"] = 32768
 
     # responseMimeType 单独处理
     if "responseMimeType" in gen_config:

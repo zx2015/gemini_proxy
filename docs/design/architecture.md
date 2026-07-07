@@ -6,6 +6,7 @@
 > 修订记录：
 > - 2026-07-02：v0.1.0 初稿
 > - 2026-07-02：v0.1.0-r1 新增 §3.5 上游重试机制、§6.5 强制模型覆盖的设计取舍；删除 `MODEL_MAPPING` 设计
+> - 2026-07-07：v0.1.0-r4 增加关键路径调试日志的组件划分与架构设计。
 
 ## 1. 技术栈
 
@@ -127,6 +128,7 @@ v0.1.0-r1 新增，详细规则见 [functional_requirements.md §2.8](../require
 | `StreamProcessor` | `app/services/stream/processor.py` | OpenAI SSE 行流 → Gemini JSON 数组流的状态机 |
 | `ErrorHandler` | `app/utils/error_handler.py` | `httpx` 异常 → Gemini `error` 包装；`finishReason` 映射 |
 | `ModelDiscovery` | `app/services/discovery.py` | 拉取上游 `/v1/models`，转换为 Gemini `models[]` 格式 |
+| `debug_logger` | `app/core/logging.py` | 提供独立的调试日志记录器，支持大容量物理文件轮转与关键请求状态捕获 |
 
 ## 5. 配置与启动流程
 
@@ -172,7 +174,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 - **原因**：用户偏好"传过来的模型不管是什么，只用指定的一个模型"——多模型映射无意义。
 - **新设计**：
   - 客户端传入的 `model` **完全忽略**（不校验、不映射、不警告）。
-  - 出站 `chat/completions` 的 `model` 字段**始终**等于 `settings.upstream_model`。
+  - 出站 `chat/completions` 的 `model` 字段**始终**等于 `settings.upstream_model`
 - **实现简化**：`RequestTransformer` 不再读取 URL 路径 `{model}`，配置层无 JSON 解析，运维更简单。
 - **可观测性**：每次请求记录 `inbound_model → outbound_model` 映射日志，便于排查。
 
@@ -200,6 +202,22 @@ v0.1.0-r1 新增（详见 [functional_requirements.md §2.8](../requirements/fun
 ```
 
 健康检查：`GET /health` 返回 `{"status":"healthy"}`；Docker healthcheck 直接 curl 该端点。
+
+## 8. 调试与排障设计 (Debug Logging)
+
+在 `v0.1.0-r4` 中，为了彻底解决 `gemini-cli` 连接不稳定的可观测性死角，引入了针对核心数据面（Data Plane）的关键路径详细调试日志捕获设计。
+
+### 8.1 隔离式日志管道
+为了避免日志量暴涨，主控制台（`stdout`）的输出保持原有的 `LOG_LEVEL` 控制（默认为 `INFO` 状态下相对静默）。调试日志将通过专属的 `gemini_debug` 记录器被完全引流向独立的文件系统中：
+- **容器与物理硬盘联动**：容器内默认路径为 `/app/logs/debug.log`，通过 Docker 挂载卷映射到宿主机的 HDD 硬盘上。
+- **主动轮转**：挂载的 Handler 被配置为 `RotatingFileHandler`（最大 `20MB`），只维护 2 个备份，从而将调试日志在物理磁盘上的空间严格限制在 `60MB` 边界以内。
+
+### 8.2 数据面关键阶段的抓取与 Session 关联
+为了在应对高并发的多轮会话和并发请求流时能够进行有效归类，每一次 API 请求均由网关动态分配一个 8 字符的十六进制 `RequestID`。并在以下四个物理边界阶段将完整的原始 Payload 序列化写入日志：
+- **阶段 1：[INBOUND_REQUEST]** -> Gemini 协议原始输入（Path + Body）。
+- **阶段 2：[OUTBOUND_REQUEST]** -> 经过 Transformer 协议映射后最终发向上游端点的完整 OpenAI Body 结构。
+- **阶段 3：[UPSTREAM_RESPONSE]** -> 上游端点发回的消息。非流式模式下记录完整响应文本；流式模式下由 SSE 拦截迭代器按 chunk 逐行抓取。
+- **阶段 4：[OUTBOUND_RESPONSE]** -> 网关响应客户端的数据帧。非流式模式下记录最终的 Gemini 响应；流式模式下由 StreamingResponse 流迭代过程逐帧打印。
 
 ## Related
 
