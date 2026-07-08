@@ -395,6 +395,51 @@ class TestRequestTransformation:
         assert msgs[2]["role"] == "user"
         assert msgs[2]["content"] == "这是一个阻隔的用户消息"
 
+    def test_truncate_historical_tool_messages(self):
+        """测试网关是否能将较早的多条巨量历史工具返回消息真实截断，而保留最近的完整内容"""
+        # 构造包含 12 条 tool 消息的 inputs，且长度都超过 400
+        contents = []
+        for i in range(12):
+            contents.append({
+                "role": "model",
+                "parts": [{
+                    "functionCall": {
+                        "name": f"tool_{i}",
+                        "id": f"call_{i}",
+                        "args": {}
+                    }
+                }]
+            })
+            contents.append({
+                "role": "user",
+                "parts": [{
+                    "functionResponse": {
+                        "name": f"tool_{i}",
+                        "id": f"call_{i}",
+                        "response": {"output": "a" * 500} # 500 字符，超长
+                    }
+                }]
+            })
+        
+        gemini = {"contents": contents}
+        out = request_transformer.transform(gemini)
+        msgs = out["messages"]
+        
+        # 提取所有的 tool 消息
+        tool_msgs = [m for m in msgs if m.get("role") == "tool"]
+        assert len(tool_msgs) == 12
+        
+        # 最近的 10 条 (第 2 到第 11 项，1-indexed 为后 10 项) 应该保留完整 500 字节
+        # 较早的 2 条 (第 0 和第 1 项) 应该被截断
+        # 对应时序中，越往后越新，因此 index 0, 1 是最早的
+        assert "HISTORICAL_TOOL_OUTPUT_TRUNCATED_LEN_514" in tool_msgs[0]["content"]
+        assert "HISTORICAL_TOOL_OUTPUT_TRUNCATED_LEN_514" in tool_msgs[1]["content"]
+        
+        # 倒数 10 条（也就是 index 2 到 11）应该保持完整 514 字节
+        for i in range(2, 12):
+            assert len(tool_msgs[i]["content"]) == 514
+            assert "HISTORICAL_TOOL_OUTPUT_TRUNCATED" not in tool_msgs[i]["content"]
+
 
 # ============================================================================
 # 响应转换矩阵（transformer.md §2.2 - §2.4）

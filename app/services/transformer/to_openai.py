@@ -143,6 +143,9 @@ class RequestTransformer:
         # ---- 7. 强约束：重排 messages 解决 OpenAI/MiniMax 规范校验问题 ----
         openai_req["messages"] = self._reorder_messages_to_follow_spec(openai_req["messages"])
 
+        # ---- 8. Payload 收紧：物理截断历史上的巨量工具消息，防止超限 ----
+        openai_req["messages"] = self._truncate_historical_tool_messages(openai_req["messages"])
+
         return openai_req
 
     @staticmethod
@@ -452,6 +455,30 @@ class RequestTransformer:
             new_msgs.insert(insert_idx, msg)
 
         return new_msgs
+
+    def _truncate_historical_tool_messages(
+        self, messages: List[Dict[str, Any]], keep_recent_count: int = 10
+    ) -> List[Dict[str, Any]]:
+        """
+        为避免巨量历史工具返回（如大量的 grep/read_file 结果）撑爆上游上下文窗口（导致 LiteLLM 静默 fallback 或 400 报错），
+        我们对超过 keep_recent_count（默认 10 条）以前的历史 role="tool" 消息的 content 进行真实截断（保留首尾各 150 字节）。
+        """
+        tool_counter = 0
+        # 从后往前遍历以确定最近的 tool 消息
+        for msg in reversed(messages):
+            if msg.get("role") == "tool":
+                tool_counter += 1
+                if tool_counter > keep_recent_count:
+                    # 属于较早的历史工具消息，如果 content 很长，进行物理收缩
+                    content = msg.get("content")
+                    if isinstance(content, str) and len(content) > 400:
+                        orig_len = len(content)
+                        msg["content"] = (
+                            content[:150]
+                            + f"\n... [HISTORICAL_TOOL_OUTPUT_TRUNCATED_LEN_{orig_len}] ...\n"
+                            + content[-150:]
+                        )
+        return messages
 
 
 # 全局单例
