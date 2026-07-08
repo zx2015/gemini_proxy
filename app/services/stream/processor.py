@@ -432,11 +432,17 @@ class StreamProcessor:
             f"default_finish={default_finish}"
         )
         if self._last_usage:
-            frame["usageMetadata"] = {
+            details = self._last_usage.get("completion_tokens_details") or {}
+            reasoning_tokens = int(details.get("reasoning_tokens") or 0)
+            completion_tokens = self._last_usage.get("completion_tokens", 0)
+            usage_meta: Dict[str, Any] = {
                 "promptTokenCount": self._last_usage.get("prompt_tokens", 0),
-                "candidatesTokenCount": self._last_usage.get("completion_tokens", 0),
+                "candidatesTokenCount": completion_tokens - reasoning_tokens,
                 "totalTokenCount": self._last_usage.get("total_tokens", 0),
             }
+            if reasoning_tokens > 0:
+                usage_meta["thoughtsTokenCount"] = reasoning_tokens
+            frame["usageMetadata"] = usage_meta
 
         return frame
 

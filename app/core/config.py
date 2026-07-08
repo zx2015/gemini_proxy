@@ -57,6 +57,14 @@ class Settings(BaseSettings):
         600.0,
         description="上游单次请求超时（秒）",
     )
+    stream_first_byte_timeout: float = Field(
+        60.0,
+        description="流式请求首个 SSE chunk 到达的最大等待时间（秒）；0 表示不限制",
+    )
+    stream_idle_timeout: float = Field(
+        120.0,
+        description="流式响应相邻两个 SSE chunk 之间的最大静默时间（秒）；0 表示不限制",
+    )
     retry_max_attempts: int = Field(
         3,
         ge=1,
@@ -80,6 +88,23 @@ class Settings(BaseSettings):
             "是否启用 MiniMax 文本内嵌 tool_call 标记恢复。"
             "开启后会尝试从 content 中提取 ]<]minimax[>[<tool_call>... 并恢复结构化工具调用。"
         ),
+    )
+
+    # ---- 熔断器 ----
+    cb_failure_threshold: int = Field(
+        5,
+        ge=1,
+        description="连续上游可重试失败多少次触发熔断（CLOSED → OPEN）",
+    )
+    cb_recovery_timeout: float = Field(
+        60.0,
+        ge=1.0,
+        description="熔断器 OPEN 后等待多少秒进入 HALF_OPEN 探针阶段",
+    )
+    cb_half_open_max_calls: int = Field(
+        1,
+        ge=1,
+        description="HALF_OPEN 状态最多同时允许多少个探针请求",
     )
 
     model_config = SettingsConfigDict(

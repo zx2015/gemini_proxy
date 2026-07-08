@@ -43,3 +43,8 @@ logs/
 *.swp
 *.swo
 .DS_Store
+
+# ----- cc-switch -----
+cc-switch/
+**/cc-switch/
+

@@ -127,11 +127,17 @@ class ResponseTransformer:
         # ---- usageMetadata ----
         usage = openai_resp.get("usage")
         if usage:
-            gemini_resp["usageMetadata"] = {
+            details = usage.get("completion_tokens_details") or {}
+            reasoning_tokens = int(details.get("reasoning_tokens") or 0)
+            completion_tokens = usage.get("completion_tokens", 0)
+            usage_meta: Dict[str, Any] = {
                 "promptTokenCount": usage.get("prompt_tokens", 0),
-                "candidatesTokenCount": usage.get("completion_tokens", 0),
+                "candidatesTokenCount": completion_tokens - reasoning_tokens,
                 "totalTokenCount": usage.get("total_tokens", 0),
             }
+            if reasoning_tokens > 0:
+                usage_meta["thoughtsTokenCount"] = reasoning_tokens
+            gemini_resp["usageMetadata"] = usage_meta
 
         return gemini_resp
 

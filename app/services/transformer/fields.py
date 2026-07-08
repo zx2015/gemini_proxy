@@ -121,6 +121,19 @@ def map_generation_config(gen_config: Optional[Dict[str, Any]]) -> Dict[str, Any
         rf = map_response_mime_type(gen_config["responseMimeType"])
         if rf:
             out["response_format"] = rf
+
+    # thinkingConfig → extra_body.thinking（LiteLLM 透传给支持推理预算的模型）
+    thinking_config = gen_config.get("thinkingConfig")
+    if isinstance(thinking_config, dict):
+        budget = thinking_config.get("thinkingBudget")
+        if budget is not None:
+            thinking_param = (
+                {"type": "disabled"}
+                if int(budget) == 0
+                else {"type": "enabled", "budget_tokens": int(budget)}
+            )
+            out.setdefault("extra_body", {})["thinking"] = thinking_param
+
     # 丢弃字段：topK / presencePenalty / frequencyPenalty / seed（OpenAI 有 seed 但语义略不同）
     return out
 
