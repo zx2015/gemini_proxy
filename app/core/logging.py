@@ -29,6 +29,10 @@ class HealthCheckFilter(logging.Filter):
 
 def setup_logging() -> None:
     """根据 settings.log_level 初始化日志。"""
+    # 强制将 stdout/stderr 的错误处理重置为 replace，防止 surrogate 字符引发 strict 模式下的崩溃
+    sys.stdout.reconfigure(errors="replace")
+    sys.stderr.reconfigure(errors="replace")
+
     log_level = settings.log_level
 
     config = {
@@ -108,7 +112,8 @@ def setup_logging() -> None:
                 log_path,
                 maxBytes=20 * 1024 * 1024,
                 backupCount=2,
-                encoding="utf-8"
+                encoding="utf-8",
+                errors="replace"
             )
             formatter = logging.Formatter(
                 fmt="%(asctime)s.%(msecs)03d %(levelname)-7s [%(name)s] %(message)s",
