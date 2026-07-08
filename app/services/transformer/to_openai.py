@@ -463,13 +463,17 @@ class RequestTransformer:
         self, messages: List[Dict[str, Any]], keep_recent_count: int = 10
     ) -> List[Dict[str, Any]]:
         """
-        为避免巨量历史工具返回（如大量的 grep/read_file 结果）撑爆上游上下文窗口（导致 LiteLLM 静默 fallback 或 400 报错），
-        我们对超过 keep_recent_count（默认 10 条）以前的历史 role="tool" 消息的 content 进行真实截断（保留首尾各 150 字节）。
+        为避免巨量历史工具返回（如大量的 grep/read_file 结果）和历史 assistant 工具参数（如巨大的 replace 替换文本）撑爆上游上下文，
+        我们对超过 keep_recent_count（默认 10 条）以前的历史消息进行物理收缩：
+        1. 对于 role="tool" 消息：直接截断 content。
+        2. 对于 role="assistant" 消息：解析其 tool_calls 中的 arguments JSON，对其中超长字段（超过150字符）进行中段裁剪，并重新序列化为合法 JSON。
         """
         tool_counter = 0
-        # 从后往前遍历以确定最近的 tool 消息
+        assistant_counter = 0
+
         for msg in reversed(messages):
-            if msg.get("role") == "tool":
+            role = msg.get("role")
+            if role == "tool":
                 tool_counter += 1
                 if tool_counter > keep_recent_count:
                     # 属于较早的历史工具消息，如果 content 很长，进行物理收缩
@@ -481,6 +485,34 @@ class RequestTransformer:
                             + f"\n... [HISTORICAL_TOOL_OUTPUT_TRUNCATED_LEN_{orig_len}] ...\n"
                             + content[-150:]
                         )
+            elif role == "assistant":
+                # 仅处理带 tool_calls 的 assistant
+                if "tool_calls" in msg:
+                    assistant_counter += 1
+                    if assistant_counter > keep_recent_count:
+                        tcs = msg.get("tool_calls") or []
+                        for tc in tcs:
+                            func = tc.get("function") or {}
+                            args_str = func.get("arguments")
+                            if isinstance(args_str, str) and len(args_str) > 300:
+                                try:
+                                    args_dict = json.loads(args_str)
+                                    modified = False
+                                    for k, v in args_dict.items():
+                                        if isinstance(v, str) and len(v) > 150:
+                                            orig_v_len = len(v)
+                                            args_dict[k] = (
+                                                v[:70]
+                                                + f" ... [HISTORICAL_ARG_TRUNCATED_LEN_{orig_v_len}] ... "
+                                                + v[-70:]
+                                            )
+                                            modified = True
+                                    if modified:
+                                        func["arguments"] = json.dumps(args_dict, ensure_ascii=False)
+                                except Exception:
+                                    # 如果解析 JSON 失败，不做激进修改，保留原样以防格式损坏
+                                    pass
+
         return messages
 
     def _prune_and_align_tool_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

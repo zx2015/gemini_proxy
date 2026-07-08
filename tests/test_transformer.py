@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import pytest
+import json
 
 from app.services.transformer.from_openai import response_transformer
 from app.services.transformer.to_openai import request_transformer
@@ -406,7 +407,7 @@ class TestRequestTransformation:
                     "functionCall": {
                         "name": f"tool_{i}",
                         "id": f"call_{i}",
-                        "args": {}
+                        "args": {"command": "b" * 500} # 500 字符，超长
                     }
                 }]
             })
@@ -425,20 +426,34 @@ class TestRequestTransformation:
         out = request_transformer.transform(gemini)
         msgs = out["messages"]
         
-        # 提取所有的 tool 消息
+        # 1. 提取所有的 tool 消息并验证
         tool_msgs = [m for m in msgs if m.get("role") == "tool"]
         assert len(tool_msgs) == 12
         
-        # 最近的 10 条 (第 2 到第 11 项，1-indexed 为后 10 项) 应该保留完整 500 字节
-        # 较早的 2 条 (第 0 和第 1 项) 应该被截断
-        # 对应时序中，越往后越新，因此 index 0, 1 是最早的
+        # 最近的 10 条（从 index 2 到 11）应该保留完整，较早的 2 条应该截断
         assert "HISTORICAL_TOOL_OUTPUT_TRUNCATED_LEN_514" in tool_msgs[0]["content"]
         assert "HISTORICAL_TOOL_OUTPUT_TRUNCATED_LEN_514" in tool_msgs[1]["content"]
         
-        # 倒数 10 条（也就是 index 2 到 11）应该保持完整 514 字节
         for i in range(2, 12):
             assert len(tool_msgs[i]["content"]) == 514
             assert "HISTORICAL_TOOL_OUTPUT_TRUNCATED" not in tool_msgs[i]["content"]
+
+        # 2. 提取所有的 assistant 消息并验证
+        assistant_msgs = [m for m in msgs if m.get("role") == "assistant"]
+        assert len(assistant_msgs) == 12
+
+        # 较早的 2 个 assistant 消息（index 0, 1）应该被裁剪
+        for idx in [0, 1]:
+            tcs = assistant_msgs[idx]["tool_calls"]
+            args_str = tcs[0]["function"]["arguments"]
+            assert "HISTORICAL_ARG_TRUNCATED_LEN_500" in args_str
+
+        # 最近的 10 个 assistant 消息应该是未被裁剪的
+        for idx in range(2, 12):
+            tcs = assistant_msgs[idx]["tool_calls"]
+            args_str = tcs[0]["function"]["arguments"]
+            assert "HISTORICAL_ARG_TRUNCATED" not in args_str
+            assert len(json.loads(args_str)["command"]) == 500
 
     def test_prune_and_align_tool_messages(self):
         """测试双向对齐剪枝算法 (Bijection Guard) 是否能物理移除不配对的工具消息"""
