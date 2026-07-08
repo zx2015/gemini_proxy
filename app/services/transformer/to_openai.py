@@ -149,6 +149,21 @@ class RequestTransformer:
         # ---- 9. Payload 收紧：物理截断历史上的巨量工具消息，防止超限 ----
         openai_req["messages"] = self._truncate_historical_tool_messages(openai_req["messages"])
 
+        # ---- 10. 净化无关联/孤立的 Unicode surrogate 字符，防止序列化为 JSON 进行 UTF-8 编码时崩溃 ----
+        def _clean_surrogates(obj: Any) -> Any:
+            if isinstance(obj, str):
+                try:
+                    return obj.encode("utf-8", errors="surrogatepass").decode("utf-8", errors="ignore")
+                except Exception:
+                    return obj
+            elif isinstance(obj, dict):
+                return {k: _clean_surrogates(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [_clean_surrogates(i) for i in obj]
+            return obj
+
+        openai_req = _clean_surrogates(openai_req)
+
         return openai_req
 
     @staticmethod
