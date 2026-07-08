@@ -531,14 +531,17 @@ class RequestTransformer:
                     if tc.get("id"):
                         active_call_ids.add(tc["id"])
 
-        # 4. 反向剪枝：只保留那些被 active_call_ids 关联的 tool 消息，并剔除空无用的 assistant
+        # 4. 反向剪枝与去重：只保留那些被 active_call_ids 关联且不重复的 tool 消息，并剔除空无用的 assistant
         final_msgs = []
+        seen_tool_ids = set()
         for msg in messages:
             role = msg.get("role")
             if role == "tool":
                 tid = msg.get("tool_call_id")
                 if tid in active_call_ids:
-                    final_msgs.append(msg)
+                    if tid not in seen_tool_ids:
+                        seen_tool_ids.add(tid)
+                        final_msgs.append(msg)
             elif role == "assistant":
                 # 如果既没有 content 也没有 tool_calls，不加入列表
                 if not msg.get("content") and "tool_calls" not in msg:
