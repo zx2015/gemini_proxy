@@ -342,11 +342,58 @@ class TestRequestTransformation:
             }],
         }
         out = request_transformer.transform(gemini)
-        assert out["messages"] == [{
+        assert len(out["messages"]) == 2
+        assert out["messages"][0]["role"] == "assistant"
+        assert out["messages"][0]["tool_calls"][0]["id"] == "call_unknown_tool"
+        assert out["messages"][1] == {
             "role": "tool",
             "tool_call_id": "call_unknown_tool",
             "content": '{"ok": true}',
-        }]
+        }
+
+    def test_messages_reordering_for_spec(self):
+        """测试在跨 content 出现 assistant -> user -> tool 时，重排能将其粘合并挪走阻隔的 user"""
+        gemini = {
+            "contents": [
+                {
+                    "role": "model",
+                    "parts": [{
+                        "functionCall": {
+                            "name": "my_tool",
+                            "id": "call_123",
+                            "args": {}
+                        }
+                    }]
+                },
+                {
+                    "role": "user",
+                    "parts": [{"text": "这是一个阻隔的用户消息"}]
+                },
+                {
+                    "role": "user",
+                    "parts": [{
+                        "functionResponse": {
+                            "name": "my_tool",
+                            "id": "call_123",
+                            "response": {"result": "ok"}
+                        }
+                    }]
+                }
+            ]
+        }
+        out = request_transformer.transform(gemini)
+        # 期望的顺序为：assistant -> tool -> user
+        msgs = out["messages"]
+        assert len(msgs) == 3
+        assert msgs[0]["role"] == "assistant"
+        assert msgs[0]["tool_calls"][0]["id"] == "call_123"
+        
+        assert msgs[1]["role"] == "tool"
+        assert msgs[1]["tool_call_id"] == "call_123"
+        assert msgs[1]["content"] == '{"result": "ok"}'
+        
+        assert msgs[2]["role"] == "user"
+        assert msgs[2]["content"] == "这是一个阻隔的用户消息"
 
 
 # ============================================================================

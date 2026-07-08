@@ -140,6 +140,9 @@ class RequestTransformer:
         # 若客户端未在提示里带上该词，则在 system 消息中补一句说明。
         self._ensure_json_hint(openai_req)
 
+        # ---- 7. 强约束：重排 messages 解决 OpenAI/MiniMax 规范校验问题 ----
+        openai_req["messages"] = self._reorder_messages_to_follow_spec(openai_req["messages"])
+
         return openai_req
 
     @staticmethod
@@ -380,6 +383,75 @@ class RequestTransformer:
                 "function": {"name": allowed[0]},
             }
         return choice
+
+    def _reorder_messages_to_follow_spec(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        OpenAI/MiniMax 强约束：role="tool" 消息必须紧跟在包含对应 tool_call_id 的 role="assistant" 消息后面。
+        
+        本算法遍历 messages，当遇到 role="tool" 消息时：
+          1. 尝试在已构建的 new_msgs 中向前寻找最近的、包含该 tool_call_id 的 assistant 消息 (A_idx)。
+          2. 如果找到了 (A_idx)，则将此 tool 消息插入到 A_idx 关联的所有已插入 tool 消息的最末尾位置。
+             具体而言，从 A_idx + 1 开始向后找，只要是 role="tool"（无论是关联哪个 tc），就继续向后，直到遇到第一个非 tool 消息或到尾部，插入该位置。
+          3. 如果没找到（属于孤儿 tool），则说明其对应的 assistant 被前置过滤或截断丢失了，为了避免上游报错，直接丢弃该 tool 消息。
+        """
+        new_msgs: List[Dict[str, Any]] = []
+        for msg in messages:
+            role = msg.get("role")
+            if role != "tool":
+                new_msgs.append(msg)
+                continue
+
+            # 这是 role="tool" 消息，我们需要将其归位
+            tid = msg.get("tool_call_id")
+            if not tid:
+                # 缺失 id 且无法关联的 tool 消息，直接丢弃
+                continue
+
+            # 在 new_msgs 中从后往前寻找包含此 id 的 assistant 消息
+            a_idx = -1
+            for idx in range(len(new_msgs) - 1, -1, -1):
+                prev_msg = new_msgs[idx]
+                if prev_msg.get("role") == "assistant" and "tool_calls" in prev_msg:
+                    tcs = prev_msg["tool_calls"] or []
+                    if any(tc.get("id") == tid for tc in tcs):
+                        a_idx = idx
+                        break
+
+            if a_idx == -1:
+                # 没有找到匹配的 assistant，说明是“孤儿 tool”消息。
+                # 为满足 OpenAI/MiniMax 时序强校验规范，我们在其前面补齐一个包含此 id 的虚拟 assistant 消息
+                tool_name = "tool"
+                if tid.startswith("call_") and len(tid) > 5:
+                    parts = tid.split("_")
+                    if len(parts) >= 3:
+                        tool_name = "_".join(parts[1:-1])
+                    elif len(parts) == 2:
+                        tool_name = parts[1]
+                
+                virtual_assistant = {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{
+                        "id": tid,
+                        "type": "function",
+                        "function": {
+                            "name": tool_name,
+                            "arguments": "{}"
+                        }
+                    }]
+                }
+                new_msgs.append(virtual_assistant)
+                a_idx = len(new_msgs) - 1
+
+            # 找到了关联的 assistant，现在我们确定它要插入的位置：
+            # 从 a_idx + 1 开始，向后跳过所有连续的 role="tool" 消息
+            insert_idx = a_idx + 1
+            while insert_idx < len(new_msgs) and new_msgs[insert_idx].get("role") == "tool":
+                insert_idx += 1
+
+            new_msgs.insert(insert_idx, msg)
+
+        return new_msgs
 
 
 # 全局单例
