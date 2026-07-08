@@ -94,7 +94,11 @@ class RequestTransformer:
                 parts, last_tool_call_ids, ordered_tool_call_ids, only_function_response=True
             )
 
-            # ---- 3.4 构造普通消息 ----
+            # ---- 3.4 把工具回传插在 messages 中（OpenAI 强约束：必须紧跟在 assistant/tool_calls 之后） ----
+            if tool_msgs_inline:
+                openai_req["messages"].extend(tool_msgs_inline)
+
+            # ---- 3.5 构造普通消息 ----
             if text_chunks or content_items or tool_calls:
                 msg: Dict[str, Any] = {"role": openai_role}
                 if text_chunks and not content_items and not tool_calls:
@@ -116,10 +120,6 @@ class RequestTransformer:
                             last_tool_call_ids[tc["function"]["name"]] = tc["id"]
                             ordered_tool_call_ids.append(tc["id"])
                 openai_req["messages"].append(msg)
-
-            # ---- 3.5 把工具回传插在本 assistant/tool_calls 之后（OpenAI 强约束） ----
-            if tool_msgs_inline:
-                openai_req["messages"].extend(tool_msgs_inline)
 
         # ---- 4. generationConfig ----
         gen_config = gemini_req.get("generationConfig", {})
