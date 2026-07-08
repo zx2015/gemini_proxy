@@ -143,7 +143,10 @@ class RequestTransformer:
         # ---- 7. 强约束：重排 messages 解决 OpenAI/MiniMax 规范校验问题 ----
         openai_req["messages"] = self._reorder_messages_to_follow_spec(openai_req["messages"])
 
-        # ---- 8. Payload 收紧：物理截断历史上的巨量工具消息，防止超限 ----
+        # ---- 8. 强约束：双向对齐剪枝，确保 tool_calls 与 tool 严格一对一配对 ----
+        openai_req["messages"] = self._prune_and_align_tool_messages(openai_req["messages"])
+
+        # ---- 9. Payload 收紧：物理截断历史上的巨量工具消息，防止超限 ----
         openai_req["messages"] = self._truncate_historical_tool_messages(openai_req["messages"])
 
         return openai_req
@@ -479,6 +482,72 @@ class RequestTransformer:
                             + content[-150:]
                         )
         return messages
+
+    def _prune_and_align_tool_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        双向剪枝与对齐算法（Bijection Guard）：
+        1. 过滤 assistant 的 tool_calls，只保留那些有对应 tool 消息回传的 id。
+        2. 丢弃那些没有被任何 assistant 的 tool_calls 关联的 tool 消息。
+        3. 如果 assistant 的 tool_calls 被删空了，且 content 为空，则移除该 assistant 消息或填充占位符，
+           确保出站的 messages 绝对不存在“有呼无应”或“无呼有应”的不对齐情况。
+        """
+        # 1. 收集当前存在的 tool 消息 ID
+        existing_tool_ids = {
+            msg["tool_call_id"] for msg in messages 
+            if msg.get("role") == "tool" and msg.get("tool_call_id")
+        }
+
+        # 2. 过滤历史 assistant 的 tool_calls
+        for idx, msg in enumerate(messages):
+            if msg.get("role") == "assistant" and "tool_calls" in msg:
+                # 检查此 assistant 消息后面是否跟了任何 user 消息或 tool 消息
+                has_subsequent_user_or_tool = False
+                for sub_msg in messages[idx + 1:]:
+                    if sub_msg.get("role") in ["user", "tool"]:
+                        has_subsequent_user_or_tool = True
+                        break
+                
+                # 如果后面没有任何 user 或 tool 消息，说明是当前最新的 Active 悬空工具呼叫，绝对不剪枝
+                if not has_subsequent_user_or_tool:
+                    continue
+
+                tcs = msg.get("tool_calls") or []
+                filtered_tcs = [tc for tc in tcs if tc.get("id") in existing_tool_ids]
+                if filtered_tcs:
+                    msg["tool_calls"] = filtered_tcs
+                else:
+                    # tool_calls 为空，物理删除
+                    msg.pop("tool_calls", None)
+                    if not msg.get("content"):
+                        # 避免空内容 assistant 报错，填入占位符
+                        msg["content"] = "[Thinking...]"
+
+        # 3. 再次收集保留下来的 active_call_ids
+        active_call_ids = set()
+        for msg in messages:
+            if msg.get("role") == "assistant" and "tool_calls" in msg:
+                tcs = msg.get("tool_calls") or []
+                for tc in tcs:
+                    if tc.get("id"):
+                        active_call_ids.add(tc["id"])
+
+        # 4. 反向剪枝：只保留那些被 active_call_ids 关联的 tool 消息，并剔除空无用的 assistant
+        final_msgs = []
+        for msg in messages:
+            role = msg.get("role")
+            if role == "tool":
+                tid = msg.get("tool_call_id")
+                if tid in active_call_ids:
+                    final_msgs.append(msg)
+            elif role == "assistant":
+                # 如果既没有 content 也没有 tool_calls，不加入列表
+                if not msg.get("content") and "tool_calls" not in msg:
+                    continue
+                final_msgs.append(msg)
+            else:
+                final_msgs.append(msg)
+
+        return final_msgs
 
 
 # 全局单例

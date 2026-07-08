@@ -440,6 +440,59 @@ class TestRequestTransformation:
             assert len(tool_msgs[i]["content"]) == 514
             assert "HISTORICAL_TOOL_OUTPUT_TRUNCATED" not in tool_msgs[i]["content"]
 
+    def test_prune_and_align_tool_messages(self):
+        """测试双向对齐剪枝算法 (Bijection Guard) 是否能物理移除不配对的工具消息"""
+        contents = [
+            # model 下发了 2 个 tool call: call_1 和 call_2
+            {
+                "role": "model",
+                "parts": [
+                    {
+                        "functionCall": {
+                            "name": "tool_1",
+                            "id": "call_1",
+                            "args": {}
+                        }
+                    },
+                    {
+                        "functionCall": {
+                            "name": "tool_2",
+                            "id": "call_2",
+                            "args": {}
+                        }
+                    }
+                ]
+            },
+            # 但用户只传回了 call_1 的结果，call_2 的结果完全缺失
+            {
+                "role": "user",
+                "parts": [{
+                    "functionResponse": {
+                        "name": "tool_1",
+                        "id": "call_1",
+                        "response": {"output": "result_1"}
+                    }
+                }]
+            }
+        ]
+
+        gemini = {"contents": contents}
+        out = request_transformer.transform(gemini)
+        msgs = out["messages"]
+
+        # 预期输出中：
+        # 1. assistant 消息的 tool_calls 列表只保留 call_1，call_2 被物理剔除
+        assistant_msgs = [m for m in msgs if m.get("role") == "assistant"]
+        assert len(assistant_msgs) == 1
+        tcs = assistant_msgs[0]["tool_calls"]
+        assert len(tcs) == 1
+        assert tcs[0]["id"] == "call_1"
+
+        # 2. 只有 call_1 的 tool 回传，没有多余或缺失的消息
+        tool_msgs = [m for m in msgs if m.get("role") == "tool"]
+        assert len(tool_msgs) == 1
+        assert tool_msgs[0]["tool_call_id"] == "call_1"
+
 
 # ============================================================================
 # 响应转换矩阵（transformer.md §2.2 - §2.4）
