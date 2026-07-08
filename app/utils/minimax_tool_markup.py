@@ -12,7 +12,7 @@ TOOL_CALL_END = f"{NAMESPACE_TOKEN}</tool_call>"
 
 _NS_RE = re.escape(NAMESPACE_TOKEN)
 _INVOKE_RE = re.compile(
-    rf"{_NS_RE}<invoke\s+name=\"([^\"]+)\">(.*?){_NS_RE}</invoke>",
+    rf"{_NS_RE}<invoke\s+name=['\"]?([^'\"\s>]+)['\"]?\s*>(.*?){_NS_RE}</invoke>",
     re.DOTALL,
 )
 _OPEN_TAG_RE = re.compile(rf"{_NS_RE}<([^/!?\s>]+)>")
